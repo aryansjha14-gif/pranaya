@@ -1,12 +1,3 @@
-// PRANAYA - local-first encrypted ledger.
-//
-// Security model, in one paragraph: the vault is a Hive box encrypted with a
-// key held in the platform keystore (flutter_secure_storage). That key is only
-// used after the user authenticates, and the box is closed again on lock or
-// when the app goes to the background. The MPIN is never stored or compared in
-// plaintext - only a salted, iterated HMAC-SHA256 digest is kept, compared in
-// constant time, with a persisted failure counter and cooldown.
-
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -16,7 +7,11 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:local_auth/local_auth.dart';
 
-const String kVaultBoxName = 'pranaya_local_vault';
+import 'core.dart';
+import 'life.dart';
+import 'money.dart';
+import 'tools.dart';
+
 const String _kPinHashKey = 'pranaya_pin_hash';
 const String _kPinSaltKey = 'pranaya_pin_salt';
 const String _kVaultKeyKey = 'pranaya_vault_key';
@@ -29,9 +24,7 @@ const int _kKdfIterations = 20000;
 
 const FlutterSecureStorage _secure = FlutterSecureStorage();
 
-/// Iterated HMAC-SHA256 over the salt, keyed by the PIN. Deliberately slow.
-/// In a hardened build, replace with a native KDF (argon2 / PBKDF2 via
-/// pointycastle) - pure-Dart iteration is a cost compromise, not best practice.
+/// Iterated HMAC-SHA256 over the salt, keyed by the PIN.
 Uint8List derivePinHash(String pin, Uint8List salt) {
   final hmac = Hmac(sha256, utf8.encode(pin));
   var block = Uint8List.fromList(salt);
@@ -75,8 +68,6 @@ class Vault {
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Hive.initFlutter();
-  // Intentionally NOT opening the vault here: the encryption key must not be
-  // usable until the user has authenticated.
   runApp(const PranayaApp());
 }
 
@@ -121,7 +112,6 @@ class _PranayaAppState extends State<PranayaApp> {
   }
 }
 
-/// Decides between first-run MPIN setup and normal unlock.
 class AuthGate extends StatefulWidget {
   final VoidCallback onThemeToggle;
   const AuthGate({super.key, required this.onThemeToggle});
@@ -144,8 +134,8 @@ class _AuthGateState extends State<AuthGate> {
 
   void _onReady() {
     Navigator.of(context).pushReplacement(
-      MaterialPageRoute(
-        builder: (_) => MainDashboard(onThemeToggle: widget.onThemeToggle),
+      MaterialPageRoute<void>(
+        builder: (_) => HomeShell(onThemeToggle: widget.onThemeToggle),
       ),
     );
   }
@@ -168,7 +158,6 @@ class _AuthGateState extends State<AuthGate> {
   }
 }
 
-/// First run only: user chooses their own MPIN.
 class PinSetupScreen extends StatefulWidget {
   final VoidCallback onConfigured;
   const PinSetupScreen({super.key, required this.onConfigured});
@@ -178,8 +167,8 @@ class PinSetupScreen extends StatefulWidget {
 }
 
 class _PinSetupScreenState extends State<PinSetupScreen> {
-  final _pin = TextEditingController();
-  final _confirm = TextEditingController();
+  final TextEditingController _pin = TextEditingController();
+  final TextEditingController _confirm = TextEditingController();
   String _error = '';
   bool _busy = false;
 
@@ -217,7 +206,7 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
+            children: <Widget>[
               Text(
                 'SET YOUR MPIN',
                 textAlign: TextAlign.center,
@@ -230,11 +219,11 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
               ),
               const SizedBox(height: 8),
               const Text(
-                'This protects your vault on this device. There is no server-side reset.',
+                'This protects everything on this device. There is no server-side reset.',
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 12, color: Colors.grey),
               ),
-              const SizedBox(height: 32),
+              const SizedBox(height: 28),
               TextField(
                 controller: _pin,
                 obscureText: true,
@@ -263,7 +252,7 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
                 onPressed: _busy ? null : _save,
                 child: Text(_busy ? 'DERIVING KEY...' : 'CREATE VAULT KEY'),
               ),
-              if (_error.isNotEmpty) ...[
+              if (_error.isNotEmpty) ...<Widget>[
                 const SizedBox(height: 16),
                 Text(
                   _error,
@@ -279,7 +268,6 @@ class _PinSetupScreenState extends State<PinSetupScreen> {
   }
 }
 
-/// Normal unlock: MPIN or biometric, with attempt limiting.
 class PinUnlockScreen extends StatefulWidget {
   final VoidCallback onUnlocked;
   const PinUnlockScreen({super.key, required this.onUnlocked});
@@ -307,16 +295,14 @@ class _PinUnlockScreenState extends State<PinUnlockScreen> {
       final until = DateTime.now().add(kLockoutDuration).millisecondsSinceEpoch;
       await _secure.write(key: _kLockUntilKey, value: '$until');
       await _secure.write(key: _kFailedAttemptsKey, value: '0');
-      setState(
-        () =>
-            _error = 'Too many attempts. Wait ${kLockoutDuration.inSeconds}s.',
-      );
+      if (!mounted) return;
+      setState(() => _error = 'Too many attempts. Wait 30 seconds.');
       return;
     }
-    setState(
-      () => _error =
-          'Incorrect MPIN. ${kMaxFailedAttempts - attempts} attempt(s) left.',
-    );
+    if (!mounted) return;
+    setState(() {
+      _error = 'Incorrect MPIN. ${kMaxFailedAttempts - attempts} left.';
+    });
   }
 
   Future<void> _verifyPin() async {
@@ -359,9 +345,7 @@ class _PinUnlockScreenState extends State<PinUnlockScreen> {
   Future<void> _verifyBiometric() async {
     try {
       if (!await _auth.canCheckBiometrics) {
-        setState(
-          () => _error = 'No biometric hardware enrolled on this device.',
-        );
+        setState(() => _error = 'No biometrics enrolled on this device.');
         return;
       }
       final ok = await _auth.authenticate(
@@ -390,7 +374,7 @@ class _PinUnlockScreenState extends State<PinUnlockScreen> {
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
+            children: <Widget>[
               Text(
                 'PRANAYA',
                 textAlign: TextAlign.center,
@@ -401,13 +385,13 @@ class _PinUnlockScreenState extends State<PinUnlockScreen> {
                   color: theme.colorScheme.primary,
                 ),
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: 6),
               const Text(
-                'Universal Life Interface Engine',
+                'Local-first life ledger',
                 textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 14, color: Colors.grey),
+                style: TextStyle(fontSize: 13, color: Colors.grey),
               ),
-              const SizedBox(height: 40),
+              const SizedBox(height: 36),
               TextField(
                 controller: _mpin,
                 obscureText: true,
@@ -446,7 +430,7 @@ class _PinUnlockScreenState extends State<PinUnlockScreen> {
                   side: BorderSide(color: theme.colorScheme.secondary),
                 ),
               ),
-              if (_error.isNotEmpty) ...[
+              if (_error.isNotEmpty) ...<Widget>[
                 const SizedBox(height: 20),
                 Text(
                   _error,
@@ -462,168 +446,110 @@ class _PinUnlockScreenState extends State<PinUnlockScreen> {
   }
 }
 
-class MainDashboard extends StatefulWidget {
+class HomeShell extends StatefulWidget {
   final VoidCallback onThemeToggle;
-  const MainDashboard({super.key, required this.onThemeToggle});
+  const HomeShell({super.key, required this.onThemeToggle});
 
   @override
-  State<MainDashboard> createState() => _MainDashboardState();
+  State<HomeShell> createState() => _HomeShellState();
 }
 
-class _MainDashboardState extends State<MainDashboard>
-    with WidgetsBindingObserver {
-  late Box _vault;
-  final TextEditingController _input = TextEditingController();
+class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
+  int _tab = 0;
+  late Repo _repo;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _vault = Hive.box(kVaultBoxName);
+    _repo = Repo(Hive.box(kVaultBoxName));
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _input.dispose();
     super.dispose();
   }
 
-  /// Re-lock whenever the app leaves the foreground: closes the encrypted box
-  /// so the key is not sitting in memory behind a stale screen.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.paused) {
-      _lockAndExit();
+      _lock();
     }
   }
 
-  Future<void> _lockAndExit() async {
+  Future<void> _lock() async {
     await Vault.close();
     if (!mounted) return;
     Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute(
+      MaterialPageRoute<void>(
         builder: (_) => AuthGate(onThemeToggle: widget.onThemeToggle),
       ),
       (_) => false,
     );
   }
 
-  void _commit() {
-    final text = _input.text.trim();
-    if (text.isEmpty) return;
-    final ts = DateTime.now().millisecondsSinceEpoch;
-    final entry = {
-      'id': 'entry_$ts',
-      'raw_string': text,
-      'timestamp': ts,
-      'inferred_category': 'Manual Input',
-    };
-    _vault.put(entry['id'], jsonEncode(entry));
-    _input.clear();
-    setState(() {});
-  }
-
-  void _delete(String key) {
-    _vault.delete(key);
-    setState(() {});
-  }
-
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final items = _vault.values.toList().reversed.toList();
+    final tabs = <Widget>[
+      MoneyTab(repo: _repo),
+      BodyTab(repo: _repo),
+      MindTab(repo: _repo),
+      TimeTab(repo: _repo),
+      ToolsTab(repo: _repo),
+    ];
 
     return Scaffold(
       appBar: AppBar(
         title: const Text(
-          'PRANAYA CORE',
-          style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 1.2),
+          'PRANAYA',
+          style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 2),
         ),
         elevation: 0,
         backgroundColor: Colors.transparent,
-        actions: [
+        actions: <Widget>[
           IconButton(
             onPressed: widget.onThemeToggle,
             icon: const Icon(Icons.palette_outlined),
           ),
           IconButton(
-            tooltip: 'Lock vault',
-            onPressed: _lockAndExit,
+            tooltip: 'Lock',
+            onPressed: _lock,
             icon: const Icon(Icons.lock_outline),
           ),
         ],
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _input,
-                    decoration: InputDecoration(
-                      hintText: 'Log an expense or note...',
-                      filled: true,
-                      fillColor: theme.colorScheme.surface,
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide.none,
-                      ),
-                    ),
-                    onSubmitted: (_) => _commit(),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                IconButton.filled(
-                  onPressed: _commit,
-                  icon: const Icon(Icons.arrow_upward),
-                ),
-              ],
-            ),
-            const SizedBox(height: 20),
-            Expanded(
-              child: items.isEmpty
-                  ? const Center(child: Text('No entries yet.'))
-                  : ListView.builder(
-                      itemCount: items.length,
-                      itemBuilder: (context, index) {
-                        final item = jsonDecode(
-                          items[index] as String,
-                        ) as Map<String, dynamic>;
-                        return Card(
-                          color: theme.colorScheme.surface,
-                          margin: const EdgeInsets.symmetric(vertical: 6),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: ListTile(
-                            title: Text(
-                              item['raw_string'] as String? ?? '',
-                              style: const TextStyle(
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                            subtitle: Text(
-                              '${item['inferred_category']} - ${item['id']}',
-                              style: const TextStyle(fontSize: 11),
-                            ),
-                            trailing: IconButton(
-                              icon: const Icon(
-                                Icons.delete_outline,
-                                color: Colors.redAccent,
-                              ),
-                              onPressed: () => _delete(item['id'] as String),
-                            ),
-                          ),
-                        );
-                      },
-                    ),
-            ),
-          ],
-        ),
+      body: IndexedStack(index: _tab, children: tabs),
+      bottomNavigationBar: BottomNavigationBar(
+        currentIndex: _tab,
+        type: BottomNavigationBarType.fixed,
+        backgroundColor: theme.colorScheme.surface,
+        selectedItemColor: theme.colorScheme.primary,
+        unselectedItemColor: Colors.grey,
+        onTap: (i) => setState(() => _tab = i),
+        items: const <BottomNavigationBarItem>[
+          BottomNavigationBarItem(
+            icon: Icon(Icons.account_balance_wallet),
+            label: 'Money',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.favorite_border),
+            label: 'Body',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.self_improvement),
+            label: 'Mind',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.checklist),
+            label: 'Time',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.handyman_outlined),
+            label: 'Tools',
+          ),
+        ],
       ),
     );
   }
