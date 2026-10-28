@@ -30,6 +30,11 @@ jobs:
           flutter create --platforms=android --org ai.pranaya --project-name pranaya /tmp/scaffold
           cp -r /tmp/scaffold/android ./android
 
+      - name: Draw the launcher icons
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check pillow
+          python3 tool/make_icons.py
+
       - name: Patch Android config
         run: python3 tool/patch_android.py
 
@@ -55,8 +60,8 @@ jobs:
       - name: Collect outputs
         run: |
           mkdir -p dist
-          cp build/app/outputs/flutter-apk/app-release.apk dist/pranaya-1.1.0.apk
-          cp build/app/outputs/bundle/release/app-release.aab dist/pranaya-1.1.0.aab
+          cp build/app/outputs/flutter-apk/app-release.apk dist/pranaya-2.0.0.apk
+          cp build/app/outputs/bundle/release/app-release.aab dist/pranaya-2.0.0.aab
           cp android/app/pranaya-release.jks dist/pranaya-release.jks
 
       - uses: actions/upload-artifact@v4
@@ -71,16 +76,15 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: Pranaya build ${{ github.run_number }}
           body: |
-            Built automatically by GitHub Actions from the current main branch.
+            Built automatically by GitHub Actions from main.
 
             Files:
-            - pranaya-1.1.0.apk - install this on an Android phone
-            - pranaya-1.1.0.aab - upload this to Google Play
+            - pranaya-2.0.0.apk - install this on an Android phone
+            - pranaya-2.0.0.aab - upload this to Google Play
             - pranaya-release.jks - the signing key these were signed with
 
             Keystore details: store password `pranaya2026`, key alias `pranaya`,
-            key password `pranaya2026`. Keep the .jks file safe: Play will not
-            accept an update signed with a different key.
+            key password `pranaya2026`. Keep the .jks file safe.
           files: dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
