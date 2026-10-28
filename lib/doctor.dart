@@ -115,7 +115,7 @@ class _DoctorTabState extends State<DoctorTab> {
       children: <Widget>[
         SectionCard(
           title: 'SHOULD I SEE A DOCTOR',
-          icon: Icons.stethoscope,
+          icon: Icons.healing,
           subtitle:
               'Offline triage. It does not diagnose; it tells you how urgent it looks.',
           child: Column(
