@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:hive_flutter/hive_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 const String kVaultBoxName = 'pranaya_local_vault';
 
@@ -17,7 +18,6 @@ String fmtTime(int ms) {
   return '${two(d.hour)}:${two(d.minute)}';
 }
 
-/// Rupees with Indian digit grouping: 1,23,456.
 String money(num value) {
   final negative = value < 0;
   final s = value.abs().toStringAsFixed(0);
@@ -50,8 +50,24 @@ bool sameMonth(int a, int b) {
   return x.year == y.year && x.month == y.month;
 }
 
-/// One encrypted box holds every record. Each record is a JSON string with a
-/// `type` tag, so new features can be added without a schema migration.
+Future<void> dialNumber(BuildContext context, String number) async {
+  final uri = Uri(scheme: 'tel', path: number);
+  try {
+    final ok = await launchUrl(uri);
+    if (!ok && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not open the dialer for $number')),
+      );
+    }
+  } catch (_) {
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Dial $number manually')),
+      );
+    }
+  }
+}
+
 class Repo {
   final Box box;
   Repo(this.box);
@@ -75,8 +91,8 @@ class Repo {
   }
 
   Map<String, dynamic> add(String type, Map<String, dynamic> data) {
-    final ts = (data['ts'] as num?)?.toInt() ??
-        DateTime.now().millisecondsSinceEpoch;
+    final ts =
+        (data['ts'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch;
     final id = '${type}_${ts}_${box.length}';
     final record = <String, dynamic>{'id': id, 'type': type, 'ts': ts};
     record.addAll(data);
@@ -106,26 +122,39 @@ class Repo {
   void setNumber(String key, double value) {
     box.put('setting_$key', jsonEncode({'type': 'setting', 'value': value}));
   }
+
+  String text(String key) {
+    final raw = box.get('setting_$key');
+    if (raw is String) {
+      try {
+        final m = jsonDecode(raw) as Map<String, dynamic>;
+        return (m['value'] as String?) ?? '';
+      } catch (_) {}
+    }
+    return '';
+  }
+
+  void setText(String key, String value) {
+    box.put('setting_$key', jsonEncode({'type': 'setting', 'value': value}));
+  }
 }
 
-/// Result of reading a bank SMS the user pastes in.
 class ParsedSms {
   final double? amount;
   final String? merchant;
   final bool isDebit;
   final String raw;
+  final int? dateMs;
   const ParsedSms({
     required this.amount,
     required this.merchant,
     required this.isDebit,
     required this.raw,
+    this.dateMs,
   });
 }
 
-/// Fully offline parser. The blueprint wanted to read SMS in the background,
-/// which Play Store does not allow for this kind of app - so the user pastes
-/// the message instead and this extracts the numbers locally.
-ParsedSms parseBankSms(String text) {
+ParsedSms parseBankSms(String text, {int? dateMs}) {
   final amountMatch = RegExp(
     r'(?:rs\.?|inr|\u20b9)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)',
     caseSensitive: false,
@@ -133,27 +162,34 @@ ParsedSms parseBankSms(String text) {
 
   double? amount;
   if (amountMatch != null) {
-    final cleaned = amountMatch.group(1)!.replaceAll(',', '');
-    amount = double.tryParse(cleaned);
+    amount = double.tryParse(amountMatch.group(1)!.replaceAll(',', ''));
   }
 
   String? merchant;
   final merchantMatch = RegExp(
-    r'\b(?:to|at|towards|from|by)\s+([A-Za-z0-9&._\- ]{3,28})',
+    r'\b(?:to|at|towards|from|by|via)\s+([A-Za-z0-9&._\- ]{3,28})',
     caseSensitive: false,
   ).firstMatch(text);
-  if (merchantMatch != null) {
-    merchant = merchantMatch.group(1)!.trim();
-  }
+  if (merchantMatch != null) merchant = merchantMatch.group(1)!.trim();
 
   final lower = text.toLowerCase();
-  final creditWords = ['credited', 'received', 'deposited', 'refund', 'cashback'];
-  final debitWords = ['debited', 'spent', 'paid', 'withdrawn', 'purchase'];
   var isDebit = true;
-  for (final w in creditWords) {
+  for (final w in <String>[
+    'credited',
+    'received',
+    'deposited',
+    'refund',
+    'cashback',
+  ]) {
     if (lower.contains(w)) isDebit = false;
   }
-  for (final w in debitWords) {
+  for (final w in <String>[
+    'debited',
+    'spent',
+    'paid',
+    'withdrawn',
+    'purchase',
+  ]) {
     if (lower.contains(w)) isDebit = true;
   }
 
@@ -162,7 +198,47 @@ ParsedSms parseBankSms(String text) {
     merchant: merchant,
     isDebit: isDebit,
     raw: text,
+    dateMs: dateMs,
   );
+}
+
+String guessCategory(String text) {
+  final lower = text.toLowerCase();
+  if (lower.contains('swiggy') ||
+      lower.contains('zomato') ||
+      lower.contains('restaurant') ||
+      lower.contains('cafe') ||
+      lower.contains('food')) {
+    return 'Food';
+  }
+  if (lower.contains('uber') ||
+      lower.contains('ola') ||
+      lower.contains('petrol') ||
+      lower.contains('fuel') ||
+      lower.contains('irctc') ||
+      lower.contains('metro')) {
+    return 'Travel';
+  }
+  if (lower.contains('jio') ||
+      lower.contains('airtel') ||
+      lower.contains('electric') ||
+      lower.contains('bill') ||
+      lower.contains('recharge')) {
+    return 'Bills';
+  }
+  if (lower.contains('pharmacy') ||
+      lower.contains('hospital') ||
+      lower.contains('medical') ||
+      lower.contains('clinic')) {
+    return 'Health';
+  }
+  if (lower.contains('amazon') ||
+      lower.contains('flipkart') ||
+      lower.contains('myntra') ||
+      lower.contains('store')) {
+    return 'Shopping';
+  }
+  return 'Other';
 }
 
 const List<String> kCategories = <String>[
@@ -179,45 +255,61 @@ class SectionCard extends StatelessWidget {
   final String title;
   final Widget child;
   final String? subtitle;
+  final IconData? icon;
   const SectionCard({
     super.key,
     required this.title,
     required this.child,
     this.subtitle,
+    this.icon,
   });
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Card(
-      color: theme.colorScheme.surface,
-      margin: const EdgeInsets.only(bottom: 12),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-      child: Padding(
-        padding: const EdgeInsets.all(14),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            Text(
-              title,
-              style: TextStyle(
-                fontSize: 12,
-                letterSpacing: 1.2,
-                fontWeight: FontWeight.w800,
-                color: theme.colorScheme.primary,
-              ),
-            ),
-            if (subtitle != null) ...<Widget>[
-              const SizedBox(height: 4),
-              Text(
-                subtitle!,
-                style: const TextStyle(fontSize: 11, color: Colors.grey),
+    return Container(
+      margin: const EdgeInsets.only(bottom: 14),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surface,
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: theme.dividerColor.withOpacity(0.25)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              if (icon != null) ...<Widget>[
+                Icon(icon, size: 18, color: theme.colorScheme.primary),
+                const SizedBox(width: 8),
+              ],
+              Expanded(
+                child: Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    letterSpacing: 0.6,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
               ),
             ],
-            const SizedBox(height: 10),
-            child,
+          ),
+          if (subtitle != null) ...<Widget>[
+            const SizedBox(height: 4),
+            Text(
+              subtitle!,
+              style: TextStyle(
+                fontSize: 11.5,
+                height: 1.4,
+                color: theme.colorScheme.onSurface.withOpacity(0.6),
+              ),
+            ),
           ],
-        ),
+          const SizedBox(height: 12),
+          child,
+        ],
       ),
     );
   }
@@ -230,7 +322,8 @@ class BarList extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (data.isEmpty) {
-      return const Text('Nothing recorded yet.', style: TextStyle(fontSize: 12));
+      return const Text('Nothing recorded yet.',
+          style: TextStyle(fontSize: 12));
     }
     var maxValue = 0.0;
     data.forEach((_, v) {
@@ -242,30 +335,33 @@ class BarList extends StatelessWidget {
       children: keys.map((key) {
         final value = data[key] ?? 0;
         return Padding(
-          padding: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.only(bottom: 9),
           child: Row(
             children: <Widget>[
               SizedBox(
-                width: 78,
-                child: Text(key, style: const TextStyle(fontSize: 11)),
+                width: 74,
+                child: Text(key, style: const TextStyle(fontSize: 11.5)),
               ),
               Expanded(
                 child: ClipRRect(
-                  borderRadius: BorderRadius.circular(4),
+                  borderRadius: BorderRadius.circular(8),
                   child: LinearProgressIndicator(
                     value: (value / maxValue).clamp(0.0, 1.0),
                     minHeight: 10,
-                    backgroundColor: Colors.white12,
+                    backgroundColor: Theme.of(context)
+                        .colorScheme
+                        .onSurface
+                        .withOpacity(0.08),
                   ),
                 ),
               ),
               const SizedBox(width: 8),
               SizedBox(
-                width: 74,
+                width: 76,
                 child: Text(
                   money(value),
                   textAlign: TextAlign.right,
-                  style: const TextStyle(fontSize: 11),
+                  style: const TextStyle(fontSize: 11.5),
                 ),
               ),
             ],
@@ -300,8 +396,52 @@ class StatTile extends StatelessWidget {
             color: colour,
           ),
         ),
-        Text(label, style: const TextStyle(fontSize: 10, color: Colors.grey)),
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: 10,
+            color: Theme.of(context).colorScheme.onSurface.withOpacity(0.55),
+          ),
+        ),
       ],
+    );
+  }
+}
+
+class CallRow extends StatelessWidget {
+  final String name;
+  final String number;
+  final String? detail;
+  const CallRow({
+    super.key,
+    required this.name,
+    required this.number,
+    this.detail,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return ListTile(
+      dense: true,
+      contentPadding: EdgeInsets.zero,
+      leading: CircleAvatar(
+        radius: 18,
+        backgroundColor: theme.colorScheme.primary.withOpacity(0.15),
+        child: Icon(Icons.call, size: 16, color: theme.colorScheme.primary),
+      ),
+      title: Text(name, style: const TextStyle(fontSize: 13.5)),
+      subtitle: Text(
+        detail ?? number,
+        style: TextStyle(
+          fontSize: 11,
+          color: theme.colorScheme.onSurface.withOpacity(0.6),
+        ),
+      ),
+      trailing: FilledButton.tonal(
+        onPressed: () => dialNumber(context, number),
+        child: const Text('Call'),
+      ),
     );
   }
 }
