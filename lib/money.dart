@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'core.dart';
+import 'notify.dart';
+import 'sms.dart';
 
 class MoneyTab extends StatefulWidget {
   final Repo repo;
@@ -16,7 +19,8 @@ class _MoneyTabState extends State<MoneyTab> {
   final TextEditingController _sms = TextEditingController();
   final TextEditingController _budget = TextEditingController();
   String _category = 'Food';
-  String _smsMessage = '';
+  String _status = '';
+  bool _importing = false;
 
   Repo get repo => widget.repo;
 
@@ -55,6 +59,25 @@ class _MoneyTabState extends State<MoneyTab> {
     return map;
   }
 
+  String get _topMerchant {
+    final counts = <String, int>{};
+    for (final e in _expenses.take(40)) {
+      final note = (e['note'] as String?) ?? '';
+      if (note.isEmpty) continue;
+      counts[note] = (counts[note] ?? 0) + 1;
+    }
+    if (counts.isEmpty) return '-';
+    var best = '';
+    var bestCount = 0;
+    counts.forEach((k, v) {
+      if (v > bestCount) {
+        best = k;
+        bestCount = v;
+      }
+    });
+    return best;
+  }
+
   void _addExpense(double value, String category, String note) {
     if (value <= 0) return;
     repo.add('expense', <String, dynamic>{
@@ -75,64 +98,87 @@ class _MoneyTabState extends State<MoneyTab> {
     _amount.clear();
     _note.clear();
     _toast('Saved.');
+    final budget = repo.number('daily_budget');
+    if (budget > 0 && _todaySpend > budget) {
+      Notifier.instance.showNow(
+        9001,
+        'Daily budget crossed',
+        'You have spent ${money(_todaySpend)} of ${money(budget)} today.',
+      );
+    }
   }
 
-  void _submitSms() {
+  void _submitPasted() {
     final text = _sms.text.trim();
     if (text.isEmpty) return;
     final parsed = parseBankSms(text);
     if (parsed.amount == null) {
-      setState(() => _smsMessage = 'No amount found in that message.');
+      setState(() => _status = 'No amount found in that message.');
       return;
     }
     if (!parsed.isDebit) {
-      setState(() => _smsMessage = 'That looks like a credit, not a spend.');
+      setState(() => _status = 'That looks like a credit, not a spend.');
       return;
     }
     _addExpense(
       parsed.amount!,
-      _guessCategory(parsed.merchant ?? text),
+      guessCategory(parsed.merchant ?? text),
       parsed.merchant ?? 'From SMS',
     );
     _sms.clear();
     setState(() {
-      _smsMessage = 'Added ${money(parsed.amount!)} from SMS.';
+      _status = 'Added ${money(parsed.amount!)} from SMS.';
     });
   }
 
-  String _guessCategory(String text) {
-    final lower = text.toLowerCase();
-    if (lower.contains('swiggy') ||
-        lower.contains('zomato') ||
-        lower.contains('restaurant') ||
-        lower.contains('cafe') ||
-        lower.contains('food')) {
-      return 'Food';
+  Future<void> _importFromInbox() async {
+    setState(() {
+      _importing = true;
+      _status = 'Reading messages...';
+    });
+    final messages = await SmsReader.readInbox();
+    if (!mounted) return;
+    if (messages.isEmpty) {
+      setState(() {
+        _importing = false;
+        _status =
+            'No messages available. Allow SMS access, or paste a message below.';
+      });
+      return;
     }
-    if (lower.contains('uber') ||
-        lower.contains('ola') ||
-        lower.contains('petrol') ||
-        lower.contains('fuel') ||
-        lower.contains('irctc')) {
-      return 'Travel';
+    var added = 0;
+    for (final m in messages) {
+      final body = (m['body'] as String?) ?? '';
+      final lower = body.toLowerCase();
+      final looksBank = lower.contains('debited') ||
+          lower.contains('spent') ||
+          lower.contains('paid') ||
+          lower.contains('withdrawn');
+      if (!looksBank) continue;
+      final dateMs = int.tryParse((m['date'] as String?) ?? '') ??
+          DateTime.now().millisecondsSinceEpoch;
+      final parsed = parseBankSms(body, dateMs: dateMs);
+      if (parsed.amount == null) continue;
+      final already = _expenses.any(
+        (e) =>
+            ((e['amount'] as num).toDouble() - parsed.amount!).abs() < 0.01 &&
+            sameDay((e['ts'] as num).toInt(), dateMs),
+      );
+      if (already) continue;
+      repo.add('expense', <String, dynamic>{
+        'amount': parsed.amount,
+        'category': guessCategory(parsed.merchant ?? body),
+        'note': parsed.merchant ?? (m['address'] as String? ?? 'SMS'),
+        'ts': dateMs,
+      });
+      added++;
     }
-    if (lower.contains('jio') ||
-        lower.contains('airtel') ||
-        lower.contains('electric') ||
-        lower.contains('bill')) {
-      return 'Bills';
-    }
-    if (lower.contains('pharmacy') ||
-        lower.contains('hospital') ||
-        lower.contains('medical')) {
-      return 'Health';
-    }
-    if (lower.contains('amazon') ||
-        lower.contains('flipkart') ||
-        lower.contains('myntra')) {
-      return 'Shopping';
-    }
-    return 'Other';
+    setState(() {
+      _importing = false;
+      _status = added == 0
+          ? 'No new bank messages found.'
+          : 'Imported $added transactions from SMS.';
+    });
   }
 
   void _toast(String message) {
@@ -141,82 +187,128 @@ class _MoneyTabState extends State<MoneyTab> {
     );
   }
 
+  void _exportSummary() {
+    final buffer = StringBuffer()
+      ..writeln(
+          'Pranaya summary ${fmtDate(DateTime.now().millisecondsSinceEpoch)}')
+      ..writeln('Spent today: ${money(_todaySpend)}')
+      ..writeln('Spent this month: ${money(_monthSpend)}')
+      ..writeln('Top payee: $_topMerchant')
+      ..writeln('By category:');
+    _byCategory.forEach((k, v) => buffer.writeln('  $k: ${money(v)}'));
+    Clipboard.setData(ClipboardData(text: buffer.toString()));
+    _toast('Summary copied to clipboard.');
+  }
+
   @override
   Widget build(BuildContext context) {
     final budget = repo.number('daily_budget');
     final progress = budget <= 0 ? 0.0 : (_todaySpend / budget).clamp(0.0, 1.0);
     final recent = _expenses.take(8).toList();
+    final theme = Theme.of(context);
 
     return ListView(
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 28),
       children: <Widget>[
-        SectionCard(
-          title: 'DAILY BUDGET GUARD',
+        Container(
+          padding: const EdgeInsets.all(20),
+          margin: const EdgeInsets.only(bottom: 14),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(26),
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: <Color>[
+                theme.colorScheme.primary.withOpacity(0.28),
+                theme.colorScheme.primary.withOpacity(0.04),
+              ],
+            ),
+          ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
+              Text(
+                'Spent today',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: theme.colorScheme.onSurface.withOpacity(0.65),
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                money(_todaySpend),
+                style: const TextStyle(
+                  fontSize: 34,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: -0.5,
+                ),
+              ),
+              const SizedBox(height: 12),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: LinearProgressIndicator(
+                  value: progress,
+                  minHeight: 9,
+                  backgroundColor: theme.colorScheme.onSurface.withOpacity(0.1),
+                ),
+              ),
+              const SizedBox(height: 12),
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: <Widget>[
-                  StatTile(
-                    label: 'spent today',
-                    value: money(_todaySpend),
-                    colour: progress > 0.99 ? Colors.redAccent : null,
-                  ),
                   StatTile(label: 'this month', value: money(_monthSpend)),
                   StatTile(
-                    label: 'daily limit',
+                    label: 'limit',
                     value: budget <= 0 ? 'not set' : money(budget),
                   ),
-                ],
-              ),
-              const SizedBox(height: 10),
-              LinearProgressIndicator(
-                value: progress,
-                minHeight: 8,
-                backgroundColor: Colors.white12,
-                color: progress > 0.99 ? Colors.redAccent : null,
-              ),
-              const SizedBox(height: 8),
-              Row(
-                children: <Widget>[
-                  Expanded(
-                    child: TextField(
-                      controller: _budget,
-                      keyboardType: TextInputType.number,
-                      decoration: const InputDecoration(
-                        hintText: 'Set daily limit, e.g. 500',
-                        isDense: true,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  TextButton(
-                    onPressed: () {
-                      final v = double.tryParse(_budget.text.trim());
-                      if (v == null || v <= 0) return;
-                      repo.setNumber('daily_budget', v);
-                      _budget.clear();
-                      setState(() {});
-                    },
-                    child: const Text('SAVE'),
-                  ),
+                  StatTile(label: 'top payee', value: _topMerchant),
                 ],
               ),
             ],
           ),
         ),
         SectionCard(
-          title: 'QUICK ADD',
+          title: 'DAILY LIMIT',
+          icon: Icons.speed,
+          child: Row(
+            children: <Widget>[
+              Expanded(
+                child: TextField(
+                  controller: _budget,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(hintText: 'e.g. 500'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              FilledButton(
+                onPressed: () {
+                  final v = double.tryParse(_budget.text.trim());
+                  if (v == null || v <= 0) return;
+                  repo.setNumber('daily_budget', v);
+                  _budget.clear();
+                  setState(() {});
+                  scheduleReminder(
+                    key: 'budget',
+                    title: 'Daily budget check',
+                    body: 'How much is left for today?',
+                    time: const TimeOfDay(hour: 20, minute: 30),
+                  );
+                  _toast('Limit saved and a nightly check scheduled.');
+                },
+                child: const Text('Save'),
+              ),
+            ],
+          ),
+        ),
+        SectionCard(
+          title: 'ADD EXPENSE',
+          icon: Icons.add_card,
           child: Column(
             children: <Widget>[
               TextField(
                 controller: _amount,
                 keyboardType: TextInputType.number,
-                decoration: const InputDecoration(
-                  hintText: 'Amount',
-                  isDense: true,
-                ),
+                decoration: const InputDecoration(hintText: 'Amount'),
               ),
               const SizedBox(height: 8),
               Row(
@@ -224,13 +316,13 @@ class _MoneyTabState extends State<MoneyTab> {
                   Expanded(
                     child: DropdownButtonFormField<String>(
                       value: _category,
-                      decoration: const InputDecoration(isDense: true),
+                      decoration: const InputDecoration(),
                       items: kCategories
                           .map(
                             (c) => DropdownMenuItem<String>(
                               value: c,
-                              child:
-                                  Text(c, style: const TextStyle(fontSize: 13)),
+                              child: Text(c,
+                                  style: const TextStyle(fontSize: 13)),
                             ),
                           )
                           .toList(),
@@ -241,64 +333,81 @@ class _MoneyTabState extends State<MoneyTab> {
                   Expanded(
                     child: TextField(
                       controller: _note,
-                      decoration: const InputDecoration(
-                        hintText: 'Note',
-                        isDense: true,
-                      ),
+                      decoration: const InputDecoration(hintText: 'Note'),
                     ),
                   ),
                 ],
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: 10),
               SizedBox(
                 width: double.infinity,
-                child: ElevatedButton(
+                child: FilledButton.icon(
                   onPressed: _submitManual,
-                  child: const Text('ADD EXPENSE'),
+                  icon: const Icon(Icons.check),
+                  label: const Text('Add'),
                 ),
               ),
             ],
           ),
         ),
         SectionCard(
-          title: 'BANK SMS PARSER',
+          title: 'SMS IMPORTER',
+          icon: Icons.sms_outlined,
           subtitle:
-              'Reading SMS in the background is blocked by Play Store, so paste the message here instead.',
+              'Reads bank messages on this phone and adds the spends. Nothing is uploaded.',
           child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: <Widget>[
+              FilledButton.tonalIcon(
+                onPressed: _importing ? null : _importFromInbox,
+                icon: const Icon(Icons.download),
+                label: Text(_importing ? 'Reading...' : 'Import from SMS inbox'),
+              ),
+              const SizedBox(height: 10),
               TextField(
                 controller: _sms,
                 maxLines: 3,
                 decoration: const InputDecoration(
-                  hintText: 'Rs.450.00 debited from A/c ... at SWIGGY on 12-05',
-                  isDense: true,
+                  hintText: 'Or paste one message: Rs.450 debited at SWIGGY',
                 ),
               ),
               const SizedBox(height: 8),
-              SizedBox(
-                width: double.infinity,
-                child: OutlinedButton(
-                  onPressed: _submitSms,
-                  child: const Text('READ MESSAGE'),
-                ),
+              OutlinedButton(
+                onPressed: _submitPasted,
+                child: const Text('Read pasted message'),
               ),
-              if (_smsMessage.isNotEmpty) ...<Widget>[
-                const SizedBox(height: 6),
+              if (_status.isNotEmpty) ...<Widget>[
+                const SizedBox(height: 8),
                 Text(
-                  _smsMessage,
-                  style: const TextStyle(fontSize: 11, color: Colors.grey),
+                  _status,
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    color: theme.colorScheme.onSurface.withOpacity(0.65),
+                  ),
                 ),
               ],
             ],
           ),
         ),
         SectionCard(
-          title: 'THIS MONTH BY CATEGORY',
-          child: BarList(data: _byCategory),
+          title: 'THIS MONTH',
+          icon: Icons.pie_chart_outline,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              BarList(data: _byCategory),
+              const SizedBox(height: 6),
+              OutlinedButton.icon(
+                onPressed: _exportSummary,
+                icon: const Icon(Icons.copy_all),
+                label: const Text('Copy summary'),
+              ),
+            ],
+          ),
         ),
         SectionCard(
-          title: 'RECENT ENTRIES',
+          title: 'RECENT',
+          icon: Icons.receipt_long,
           child: recent.isEmpty
               ? const Text('Nothing yet.', style: TextStyle(fontSize: 12))
               : Column(
@@ -306,6 +415,18 @@ class _MoneyTabState extends State<MoneyTab> {
                     return ListTile(
                       dense: true,
                       contentPadding: EdgeInsets.zero,
+                      leading: CircleAvatar(
+                        radius: 16,
+                        backgroundColor:
+                            theme.colorScheme.primary.withOpacity(0.15),
+                        child: Text(
+                          ((e['category'] as String?) ?? 'O').substring(0, 1),
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: theme.colorScheme.primary,
+                          ),
+                        ),
+                      ),
                       title: Text(
                         (e['note'] as String?)?.isNotEmpty == true
                             ? e['note'] as String
@@ -325,8 +446,8 @@ class _MoneyTabState extends State<MoneyTab> {
                           ),
                           IconButton(
                             icon: const Icon(
-                              Icons.delete_outline,
-                              size: 18,
+                              Icons.close,
+                              size: 16,
                               color: Colors.redAccent,
                             ),
                             onPressed: () {
@@ -342,10 +463,12 @@ class _MoneyTabState extends State<MoneyTab> {
         ),
         SubscriptionCard(repo: repo, onChanged: () => setState(() {})),
         ImpulseHoldCard(repo: repo, onChanged: () => setState(() {})),
+        RecurringBillsCard(repo: repo, onChanged: () => setState(() {})),
         SavingsGoalCard(repo: repo),
         InflationCard(repo: repo),
         DebtCard(repo: repo),
         SplitBillCard(repo: repo),
+        UnitPriceCard(repo: repo),
       ],
     );
   }
@@ -373,11 +496,11 @@ class _SubscriptionCardState extends State<SubscriptionCard> {
     final subs = widget.repo.list('sub');
     var monthly = 0.0;
     for (final s in subs) {
-      final amount = (s['amount'] as num).toDouble();
-      monthly += s['cycle'] == 'yearly' ? amount / 12 : amount;
+      monthly += (s['amount'] as num).toDouble();
     }
     return SectionCard(
-      title: 'SUBSCRIPTION DRAIN',
+      title: 'SUBSCRIPTIONS',
+      icon: Icons.autorenew,
       subtitle: 'Monthly total: ${money(monthly)}',
       child: Column(
         children: <Widget>[
@@ -385,20 +508,15 @@ class _SubscriptionCardState extends State<SubscriptionCard> {
             (s) => ListTile(
               dense: true,
               contentPadding: EdgeInsets.zero,
-              title: Text(
-                s['name'] as String,
-                style: const TextStyle(fontSize: 13),
-              ),
+              title: Text(s['name'] as String,
+                  style: const TextStyle(fontSize: 13)),
               subtitle: Text(
-                '${money((s['amount'] as num).toDouble())} / ${s['cycle']}',
+                '${money((s['amount'] as num).toDouble())} per month',
                 style: const TextStyle(fontSize: 10),
               ),
               trailing: IconButton(
-                icon: const Icon(
-                  Icons.delete_outline,
-                  size: 18,
-                  color: Colors.redAccent,
-                ),
+                icon: const Icon(Icons.close,
+                    size: 16, color: Colors.redAccent),
                 onPressed: () {
                   widget.repo.remove(s['id'] as String);
                   widget.onChanged();
@@ -412,33 +530,26 @@ class _SubscriptionCardState extends State<SubscriptionCard> {
               Expanded(
                 child: TextField(
                   controller: _name,
-                  decoration: const InputDecoration(
-                    hintText: 'Netflix',
-                    isDense: true,
-                  ),
+                  decoration: const InputDecoration(hintText: 'Netflix'),
                 ),
               ),
               const SizedBox(width: 8),
               SizedBox(
-                width: 90,
+                width: 92,
                 child: TextField(
                   controller: _cost,
                   keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    hintText: '649',
-                    isDense: true,
-                  ),
+                  decoration: const InputDecoration(hintText: '649'),
                 ),
               ),
               IconButton(
-                icon: const Icon(Icons.add_circle_outline),
+                icon: const Icon(Icons.add_circle),
                 onPressed: () {
                   final cost = double.tryParse(_cost.text.trim());
                   if (_name.text.trim().isEmpty || cost == null) return;
                   widget.repo.add('sub', <String, dynamic>{
                     'name': _name.text.trim(),
                     'amount': cost,
-                    'cycle': 'monthly',
                   });
                   _name.clear();
                   _cost.clear();
@@ -476,21 +587,21 @@ class _ImpulseHoldCardState extends State<ImpulseHoldCard> {
     final holds = widget.repo.list('hold');
     final now = DateTime.now().millisecondsSinceEpoch;
     return SectionCard(
-      title: 'IMPULSE HOLD (24 HOURS)',
-      subtitle: 'Park a purchase here instead of buying it now.',
+      title: 'IMPULSE HOLD',
+      icon: Icons.hourglass_bottom,
+      subtitle: 'Park a purchase for 24 hours before deciding.',
       child: Column(
         children: <Widget>[
           ...holds.map((h) {
             final created = (h['ts'] as num).toInt();
             final leftMs = created + 24 * 3600 * 1000 - now;
-            final hoursLeft = (leftMs / 3600000).clamp(0, 24).toStringAsFixed(1);
+            final hoursLeft =
+                (leftMs / 3600000).clamp(0, 24).toStringAsFixed(1);
             return ListTile(
               dense: true,
               contentPadding: EdgeInsets.zero,
-              title: Text(
-                h['item'] as String,
-                style: const TextStyle(fontSize: 13),
-              ),
+              title: Text(h['item'] as String,
+                  style: const TextStyle(fontSize: 13)),
               subtitle: Text(
                 leftMs > 0
                     ? '${hoursLeft}h left - ${money((h['amount'] as num).toDouble())}'
@@ -498,7 +609,7 @@ class _ImpulseHoldCardState extends State<ImpulseHoldCard> {
                 style: const TextStyle(fontSize: 10),
               ),
               trailing: IconButton(
-                icon: const Icon(Icons.close, size: 18),
+                icon: const Icon(Icons.close, size: 16),
                 onPressed: () {
                   widget.repo.remove(h['id'] as String);
                   widget.onChanged();
@@ -512,24 +623,20 @@ class _ImpulseHoldCardState extends State<ImpulseHoldCard> {
               Expanded(
                 child: TextField(
                   controller: _item,
-                  decoration: const InputDecoration(
-                    hintText: 'What do you want to buy?',
-                    isDense: true,
-                  ),
+                  decoration: const InputDecoration(hintText: 'What to buy?'),
                 ),
               ),
               const SizedBox(width: 8),
               SizedBox(
-                width: 80,
+                width: 84,
                 child: TextField(
                   controller: _cost,
                   keyboardType: TextInputType.number,
-                  decoration:
-                      const InputDecoration(hintText: 'Rs', isDense: true),
+                  decoration: const InputDecoration(hintText: 'Rs'),
                 ),
               ),
               IconButton(
-                icon: const Icon(Icons.add_circle_outline),
+                icon: const Icon(Icons.add_circle),
                 onPressed: () {
                   final cost = double.tryParse(_cost.text.trim()) ?? 0;
                   if (_item.text.trim().isEmpty) return;
@@ -539,6 +646,106 @@ class _ImpulseHoldCardState extends State<ImpulseHoldCard> {
                   });
                   _item.clear();
                   _cost.clear();
+                  widget.onChanged();
+                  setState(() {});
+                },
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class RecurringBillsCard extends StatefulWidget {
+  final Repo repo;
+  final VoidCallback onChanged;
+  const RecurringBillsCard({
+    super.key,
+    required this.repo,
+    required this.onChanged,
+  });
+
+  @override
+  State<RecurringBillsCard> createState() => _RecurringBillsCardState();
+}
+
+class _RecurringBillsCardState extends State<RecurringBillsCard> {
+  final TextEditingController _name = TextEditingController();
+  final TextEditingController _day = TextEditingController();
+
+  @override
+  Widget build(BuildContext context) {
+    final bills = widget.repo.list('bill');
+    final today = DateTime.now().day;
+    return SectionCard(
+      title: 'MONTHLY BILLS',
+      icon: Icons.event_repeat,
+      subtitle: 'Tap the bell to get a reminder on that date.',
+      child: Column(
+        children: <Widget>[
+          ...bills.map((b) {
+            final due = (b['day'] as num).toInt();
+            final soon = due >= today && due - today <= 3;
+            return ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              title: Text(b['name'] as String,
+                  style: const TextStyle(fontSize: 13)),
+              subtitle: Text(
+                soon ? 'Due on day $due - coming up' : 'Due on day $due',
+                style: TextStyle(
+                  fontSize: 10,
+                  color: soon ? Colors.orangeAccent : null,
+                ),
+              ),
+              trailing: IconButton(
+                icon: const Icon(Icons.notifications_active, size: 18),
+                onPressed: () {
+                  scheduleReminder(
+                    key: 'bill_${b['name']}',
+                    title: 'Bill due: ${b['name']}',
+                    body: 'Today is the usual date for this bill.',
+                    time: const TimeOfDay(hour: 9, minute: 0),
+                  );
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Daily 9 am reminder set for this bill.'),
+                    ),
+                  );
+                },
+              ),
+            );
+          }),
+          Row(
+            children: <Widget>[
+              Expanded(
+                child: TextField(
+                  controller: _name,
+                  decoration: const InputDecoration(hintText: 'Electricity'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              SizedBox(
+                width: 70,
+                child: TextField(
+                  controller: _day,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(hintText: 'Day'),
+                ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.add_circle),
+                onPressed: () {
+                  final day = int.tryParse(_day.text.trim());
+                  if (_name.text.trim().isEmpty || day == null) return;
+                  widget.repo.add('bill', <String, dynamic>{
+                    'name': _name.text.trim(),
+                    'day': day.clamp(1, 28),
+                  });
+                  _name.clear();
+                  _day.clear();
                   widget.onChanged();
                   setState(() {});
                 },
@@ -583,49 +790,24 @@ class _SavingsGoalCardState extends State<SavingsGoalCard> {
 
   @override
   Widget build(BuildContext context) {
-    return SectionCard(
+    return _CalcCard(
       title: 'GOAL CALCULATOR',
-      child: Column(
-        children: <Widget>[
-          Row(
-            children: <Widget>[
-              Expanded(
-                child: TextField(
-                  controller: _target,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    hintText: 'Target amount',
-                    isDense: true,
-                  ),
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: TextField(
-                  controller: _monthly,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    hintText: 'Save per month',
-                    isDense: true,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          SizedBox(
-            width: double.infinity,
-            child: OutlinedButton(
-              onPressed: _calculate,
-              child: const Text('CALCULATE'),
-            ),
-          ),
-          if (_result.isNotEmpty) ...<Widget>[
-            const SizedBox(height: 6),
-            Text(_result, style: const TextStyle(fontSize: 12)),
-          ],
-        ],
-      ),
+      icon: Icons.flag_outlined,
+      fields: <Widget>[
+        TextField(
+          controller: _target,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(hintText: 'Target amount'),
+        ),
+        const SizedBox(width: 8),
+        TextField(
+          controller: _monthly,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(hintText: 'Per month'),
+        ),
+      ],
+      result: _result,
+      onCalculate: _calculate,
     );
   }
 }
@@ -645,9 +827,7 @@ class _InflationCardState extends State<InflationCard> {
 
   double _pow(double base, int exponent) {
     var result = 1.0;
-    var count = exponent;
-    if (count < 1) count = 1;
-    for (var i = 0; i < count; i++) {
+    for (var i = 0; i < exponent; i++) {
       result *= base;
     }
     return result;
@@ -660,11 +840,10 @@ class _InflationCardState extends State<InflationCard> {
       setState(() => _result = 'Enter both numbers.');
       return;
     }
-    const rate = 0.06;
-    final future = amount * _pow(1 + rate, years);
-    final worth = amount / _pow(1 + rate, years);
+    final future = amount * _pow(1.06, years);
+    final worth = amount / _pow(1.06, years);
     setState(() {
-      _result = 'At 6 percent inflation, ${money(amount)} today will need '
+      _result = 'At 6 percent inflation, ${money(amount)} today needs '
           '${money(future)} in $years years. ${money(amount)} then is worth '
           '${money(worth)} today.';
     });
@@ -672,49 +851,24 @@ class _InflationCardState extends State<InflationCard> {
 
   @override
   Widget build(BuildContext context) {
-    return SectionCard(
+    return _CalcCard(
       title: 'INFLATION IMPACT',
-      child: Column(
-        children: <Widget>[
-          Row(
-            children: <Widget>[
-              Expanded(
-                child: TextField(
-                  controller: _amount,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    hintText: 'Amount today',
-                    isDense: true,
-                  ),
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: TextField(
-                  controller: _years,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    hintText: 'Years',
-                    isDense: true,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          SizedBox(
-            width: double.infinity,
-            child: OutlinedButton(
-              onPressed: _calculate,
-              child: const Text('CALCULATE'),
-            ),
-          ),
-          if (_result.isNotEmpty) ...<Widget>[
-            const SizedBox(height: 6),
-            Text(_result, style: const TextStyle(fontSize: 12)),
-          ],
-        ],
-      ),
+      icon: Icons.trending_up,
+      fields: <Widget>[
+        TextField(
+          controller: _amount,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(hintText: 'Amount today'),
+        ),
+        const SizedBox(width: 8),
+        TextField(
+          controller: _years,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(hintText: 'Years'),
+        ),
+      ],
+      result: _result,
+      onCalculate: _calculate,
     );
   }
 }
@@ -766,62 +920,30 @@ class _DebtCardState extends State<DebtCard> {
 
   @override
   Widget build(BuildContext context) {
-    return SectionCard(
+    return _CalcCard(
       title: 'DEBT PAYOFF',
-      child: Column(
-        children: <Widget>[
-          Row(
-            children: <Widget>[
-              Expanded(
-                child: TextField(
-                  controller: _balance,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    hintText: 'Balance',
-                    isDense: true,
-                  ),
-                ),
-              ),
-              const SizedBox(width: 6),
-              SizedBox(
-                width: 70,
-                child: TextField(
-                  controller: _rate,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    hintText: 'percent',
-                    isDense: true,
-                  ),
-                ),
-              ),
-              const SizedBox(width: 6),
-              SizedBox(
-                width: 80,
-                child: TextField(
-                  controller: _payment,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    hintText: 'EMI',
-                    isDense: true,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          SizedBox(
-            width: double.infinity,
-            child: OutlinedButton(
-              onPressed: _calculate,
-              child: const Text('CALCULATE'),
-            ),
-          ),
-          if (_result.isNotEmpty) ...<Widget>[
-            const SizedBox(height: 6),
-            Text(_result, style: const TextStyle(fontSize: 12)),
-          ],
-        ],
-      ),
+      icon: Icons.account_balance,
+      fields: <Widget>[
+        TextField(
+          controller: _balance,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(hintText: 'Balance'),
+        ),
+        const SizedBox(width: 6),
+        TextField(
+          controller: _rate,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(hintText: 'Rate %'),
+        ),
+        const SizedBox(width: 6),
+        TextField(
+          controller: _payment,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(hintText: 'EMI'),
+        ),
+      ],
+      result: _result,
+      onCalculate: _calculate,
     );
   }
 }
@@ -859,46 +981,166 @@ class _SplitBillCardState extends State<SplitBillCard> {
 
   @override
   Widget build(BuildContext context) {
-    return SectionCard(
+    return _CalcCard(
       title: 'SPLIT BILL',
+      icon: Icons.groups_outlined,
+      fields: <Widget>[
+        TextField(
+          controller: _total,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(hintText: 'Bill total'),
+        ),
+        const SizedBox(width: 8),
+        TextField(
+          controller: _people,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(hintText: 'People'),
+        ),
+      ],
+      result: _result,
+      onCalculate: _split,
+    );
+  }
+}
+
+class UnitPriceCard extends StatefulWidget {
+  final Repo repo;
+  const UnitPriceCard({super.key, required this.repo});
+
+  @override
+  State<UnitPriceCard> createState() => _UnitPriceCardState();
+}
+
+class _UnitPriceCardState extends State<UnitPriceCard> {
+  final TextEditingController _priceA = TextEditingController();
+  final TextEditingController _sizeA = TextEditingController();
+  final TextEditingController _priceB = TextEditingController();
+  final TextEditingController _sizeB = TextEditingController();
+  String _result = '';
+
+  void _compare() {
+    final pa = double.tryParse(_priceA.text.trim());
+    final sa = double.tryParse(_sizeA.text.trim());
+    final pb = double.tryParse(_priceB.text.trim());
+    final sb = double.tryParse(_sizeB.text.trim());
+    if (pa == null ||
+        sa == null ||
+        pb == null ||
+        sb == null ||
+        sa <= 0 ||
+        sb <= 0) {
+      setState(() => _result = 'Fill all four fields.');
+      return;
+    }
+    final perA = pa / sa;
+    final perB = pb / sb;
+    final cheaper = perA < perB ? 'A' : 'B';
+    setState(() {
+      _result = 'A: ${perA.toStringAsFixed(2)} per unit, '
+          'B: ${perB.toStringAsFixed(2)} per unit. Pack $cheaper is cheaper.';
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SectionCard(
+      title: 'PACK PRICE COMPARISON',
+      icon: Icons.compare_arrows,
       child: Column(
         children: <Widget>[
           Row(
             children: <Widget>[
               Expanded(
                 child: TextField(
-                  controller: _total,
+                  controller: _priceA,
                   keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    hintText: 'Bill total',
-                    isDense: true,
-                  ),
+                  decoration: const InputDecoration(hintText: 'A price'),
                 ),
               ),
               const SizedBox(width: 8),
               Expanded(
                 child: TextField(
-                  controller: _people,
+                  controller: _sizeA,
                   keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    hintText: 'People',
-                    isDense: true,
-                  ),
+                  decoration: const InputDecoration(hintText: 'A grams'),
                 ),
               ),
             ],
           ),
           const SizedBox(height: 8),
+          Row(
+            children: <Widget>[
+              Expanded(
+                child: TextField(
+                  controller: _priceB,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(hintText: 'B price'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: TextField(
+                  controller: _sizeB,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(hintText: 'B grams'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
           SizedBox(
             width: double.infinity,
             child: OutlinedButton(
-              onPressed: _split,
-              child: const Text('SPLIT'),
+              onPressed: _compare,
+              child: const Text('Compare'),
             ),
           ),
           if (_result.isNotEmpty) ...<Widget>[
-            const SizedBox(height: 6),
+            const SizedBox(height: 8),
             Text(_result, style: const TextStyle(fontSize: 12)),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _CalcCard extends StatelessWidget {
+  final String title;
+  final IconData icon;
+  final List<Widget> fields;
+  final String result;
+  final VoidCallback onCalculate;
+  const _CalcCard({
+    required this.title,
+    required this.icon,
+    required this.fields,
+    required this.result,
+    required this.onCalculate,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SectionCard(
+      title: title,
+      icon: icon,
+      child: Column(
+        children: <Widget>[
+          Row(children: fields),
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton(
+              onPressed: onCalculate,
+              child: const Text('Calculate'),
+            ),
+          ),
+          if (result.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Text(result, style: const TextStyle(fontSize: 12)),
+            ),
           ],
         ],
       ),
