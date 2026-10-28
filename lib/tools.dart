@@ -13,9 +13,14 @@ class ToolsTab extends StatefulWidget {
 class _ToolsTabState extends State<ToolsTab> {
   final TextEditingController _note = TextEditingController();
   final TextEditingController _value = TextEditingController();
+  final TextEditingController _bill = TextEditingController();
+  final TextEditingController _percent = TextEditingController();
+  final TextEditingController _birth = TextEditingController();
   String _from = 'km';
   String _to = 'miles';
   String _converted = '';
+  String _discountResult = '';
+  String _ageResult = '';
 
   Repo get repo => widget.repo;
 
@@ -27,6 +32,8 @@ class _ToolsTabState extends State<ToolsTab> {
     'kg': 1,
     'g': 0.001,
     'lb': 0.453592,
+    'litre': 1,
+    'ml': 0.001,
   };
 
   void _convert() {
@@ -37,9 +44,40 @@ class _ToolsTabState extends State<ToolsTab> {
       setState(() => _converted = 'Enter a number.');
       return;
     }
-    final result = input * a / b;
     setState(() {
-      _converted = '${result.toStringAsFixed(3)} $_to';
+      _converted = '${(input * a / b).toStringAsFixed(3)} $_to';
+    });
+  }
+
+  void _discount() {
+    final bill = double.tryParse(_bill.text.trim());
+    final percent = double.tryParse(_percent.text.trim());
+    if (bill == null || percent == null) {
+      setState(() => _discountResult = 'Enter both numbers.');
+      return;
+    }
+    final off = bill * percent / 100;
+    setState(() {
+      _discountResult =
+          'You save ${money(off)}. Final price ${money(bill - off)}.';
+    });
+  }
+
+  void _age() {
+    final date = DateTime.tryParse(_birth.text.trim());
+    if (date == null) {
+      setState(() => _ageResult = 'Use the format 2001-08-15.');
+      return;
+    }
+    final now = DateTime.now();
+    var years = now.year - date.year;
+    if (now.month < date.month ||
+        (now.month == date.month && now.day < date.day)) {
+      years--;
+    }
+    final days = now.difference(date).inDays;
+    setState(() {
+      _ageResult = '$years years old, $days days so far.';
     });
   }
 
@@ -48,19 +86,18 @@ class _ToolsTabState extends State<ToolsTab> {
     final notes = repo.list('note');
 
     return ListView(
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 28),
       children: <Widget>[
         SectionCard(
           title: 'QUICK NOTES',
+          icon: Icons.sticky_note_2_outlined,
           child: Column(
             children: <Widget>[
               TextField(
                 controller: _note,
                 maxLines: 2,
-                decoration: const InputDecoration(
-                  hintText: 'Anything you want to keep',
-                  isDense: true,
-                ),
+                decoration:
+                    const InputDecoration(hintText: 'Anything to keep'),
               ),
               const SizedBox(height: 8),
               SizedBox(
@@ -74,27 +111,22 @@ class _ToolsTabState extends State<ToolsTab> {
                     _note.clear();
                     setState(() {});
                   },
-                  child: const Text('SAVE'),
+                  child: const Text('Save'),
                 ),
               ),
               ...notes.map(
                 (n) => ListTile(
                   dense: true,
                   contentPadding: EdgeInsets.zero,
-                  title: Text(
-                    n['text'] as String,
-                    style: const TextStyle(fontSize: 13),
-                  ),
+                  title: Text(n['text'] as String,
+                      style: const TextStyle(fontSize: 13)),
                   subtitle: Text(
                     fmtDate((n['ts'] as num).toInt()),
                     style: const TextStyle(fontSize: 10),
                   ),
                   trailing: IconButton(
-                    icon: const Icon(
-                      Icons.delete_outline,
-                      size: 18,
-                      color: Colors.redAccent,
-                    ),
+                    icon: const Icon(Icons.close,
+                        size: 16, color: Colors.redAccent),
                     onPressed: () {
                       repo.remove(n['id'] as String);
                       setState(() {});
@@ -107,15 +139,13 @@ class _ToolsTabState extends State<ToolsTab> {
         ),
         SectionCard(
           title: 'UNIT CONVERTER',
+          icon: Icons.swap_horiz,
           child: Column(
             children: <Widget>[
               TextField(
                 controller: _value,
                 keyboardType: TextInputType.number,
-                decoration: const InputDecoration(
-                  hintText: 'Value',
-                  isDense: true,
-                ),
+                decoration: const InputDecoration(hintText: 'Value'),
               ),
               const SizedBox(height: 8),
               Row(
@@ -123,13 +153,13 @@ class _ToolsTabState extends State<ToolsTab> {
                   Expanded(
                     child: DropdownButtonFormField<String>(
                       value: _from,
-                      decoration: const InputDecoration(isDense: true),
+                      decoration: const InputDecoration(),
                       items: _units.keys
                           .map(
                             (u) => DropdownMenuItem<String>(
                               value: u,
-                              child:
-                                  Text(u, style: const TextStyle(fontSize: 13)),
+                              child: Text(u,
+                                  style: const TextStyle(fontSize: 13)),
                             ),
                           )
                           .toList(),
@@ -137,19 +167,19 @@ class _ToolsTabState extends State<ToolsTab> {
                     ),
                   ),
                   const Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 6),
+                    padding: EdgeInsets.symmetric(horizontal: 8),
                     child: Text('to'),
                   ),
                   Expanded(
                     child: DropdownButtonFormField<String>(
                       value: _to,
-                      decoration: const InputDecoration(isDense: true),
+                      decoration: const InputDecoration(),
                       items: _units.keys
                           .map(
                             (u) => DropdownMenuItem<String>(
                               value: u,
-                              child:
-                                  Text(u, style: const TextStyle(fontSize: 13)),
+                              child: Text(u,
+                                  style: const TextStyle(fontSize: 13)),
                             ),
                           )
                           .toList(),
@@ -158,53 +188,101 @@ class _ToolsTabState extends State<ToolsTab> {
                   ),
                 ],
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: 10),
               SizedBox(
                 width: double.infinity,
                 child: OutlinedButton(
                   onPressed: _convert,
-                  child: const Text('CONVERT'),
+                  child: const Text('Convert'),
                 ),
               ),
               if (_converted.isNotEmpty) ...<Widget>[
-                const SizedBox(height: 6),
-                Text(_converted, style: const TextStyle(fontSize: 14)),
+                const SizedBox(height: 8),
+                Text(_converted,
+                    style: const TextStyle(
+                        fontSize: 15, fontWeight: FontWeight.w700)),
+              ],
+            ],
+          ),
+        ),
+        SectionCard(
+          title: 'DISCOUNT',
+          icon: Icons.percent,
+          child: Column(
+            children: <Widget>[
+              Row(
+                children: <Widget>[
+                  Expanded(
+                    child: TextField(
+                      controller: _bill,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(hintText: 'Bill'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: TextField(
+                      controller: _percent,
+                      keyboardType: TextInputType.number,
+                      decoration:
+                          const InputDecoration(hintText: 'Percent off'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton(
+                  onPressed: _discount,
+                  child: const Text('Work it out'),
+                ),
+              ),
+              if (_discountResult.isNotEmpty) ...<Widget>[
+                const SizedBox(height: 8),
+                Text(_discountResult, style: const TextStyle(fontSize: 12.5)),
+              ],
+            ],
+          ),
+        ),
+        SectionCard(
+          title: 'AGE',
+          icon: Icons.cake_outlined,
+          child: Column(
+            children: <Widget>[
+              TextField(
+                controller: _birth,
+                decoration: const InputDecoration(
+                  hintText: 'Birth date 2001-08-15',
+                ),
+              ),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton(
+                  onPressed: _age,
+                  child: const Text('Calculate'),
+                ),
+              ),
+              if (_ageResult.isNotEmpty) ...<Widget>[
+                const SizedBox(height: 8),
+                Text(_ageResult, style: const TextStyle(fontSize: 12.5)),
               ],
             ],
           ),
         ),
         const PhrasebookCard(),
         SectionCard(
-          title: 'EMERGENCY NUMBERS (INDIA)',
+          title: 'EMERGENCY NUMBERS',
+          icon: Icons.emergency_outlined,
+          subtitle: 'Tap Call to open the dialer.',
           child: Column(
             children: const <Widget>[
-              ListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                title: Text('108 - Ambulance', style: TextStyle(fontSize: 13)),
-              ),
-              ListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                title: Text('100 - Police', style: TextStyle(fontSize: 13)),
-              ),
-              ListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                title: Text('101 - Fire', style: TextStyle(fontSize: 13)),
-              ),
-              ListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                title: Text('112 - All emergencies',
-                    style: TextStyle(fontSize: 13)),
-              ),
-              ListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                title: Text('14416 - Mental health helpline',
-                    style: TextStyle(fontSize: 13)),
-              ),
+              CallRow(name: 'All emergencies', number: '112'),
+              CallRow(name: 'Ambulance', number: '108'),
+              CallRow(name: 'Police', number: '100'),
+              CallRow(name: 'Fire', number: '101'),
+              CallRow(name: 'Mental health', number: '14416'),
             ],
           ),
         ),
@@ -253,12 +331,13 @@ class _PhrasebookCardState extends State<PhrasebookCard> {
     final phrases = _book[_language] ?? <List<String>>[];
     return SectionCard(
       title: 'OFFLINE PHRASEBOOK',
+      icon: Icons.translate,
       subtitle: 'Works with no internet.',
       child: Column(
         children: <Widget>[
           DropdownButtonFormField<String>(
             value: _language,
-            decoration: const InputDecoration(isDense: true),
+            decoration: const InputDecoration(),
             items: _book.keys
                 .map(
                   (l) => DropdownMenuItem<String>(
